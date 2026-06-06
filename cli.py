@@ -26,6 +26,7 @@ p.add_argument('--eps',          type=float, default=8/255)
 p.add_argument('--batch-size',   type=int,   default=16)
 p.add_argument('--n-samples',    type=int,   default=None)
 p.add_argument('--n-batches',    type=int,   default=None)
+p.add_argument('--crop-size', type=int, default=84)
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -81,44 +82,56 @@ if __name__ == "__main__":
         batch = images.shape[0]
 
         indices, attn = topk_patches(images, dinov2, k=10)
-        crops = extract_crops(images, indices, crop_size=84) # (batch, 10, 3, 224, 224)
+        # crops = extract_crops(images, indices, crop_size=args.crop_size)  # (batch, 10, 3, 224, 224)
 
         local_token  = torch.zeros(batch, 768, 16, 16, device=device)
         global_token = torch.zeros(batch, 768, 16, 16, device=device)
 
         with torch.no_grad():
-            for step in range(crops.shape[1]):
-                crop = crops[:, step]  #  (batch, 3, 224, 224)
+            results = []
+            y_null  = torch.full((1,), dit.y_embedder.num_classes,
+                                  dtype=torch.long, device=device)
 
-                z_i = rae.encode(crop) # (B, 768, 16, 16)
-                local_token = local_token + z_i
-                
-                local_norm = local_token / (step + 1) # normalize local for DiT
+            for b in range(batch):
+                local_token  = torch.zeros(1, 768, 16, 16, device=device)
+                global_token = torch.zeros(1, 768, 16, 16, device=device)
+                z_full       = rae.encode(images[b:b+1])   # (1, 768, 16, 16)
 
-                noise = torch.randn_like(local_norm)
-                z_t = (1 - args.t_noise) * local_norm + args.t_noise * noise
+                for step in range(indices.shape[1]):        # k=10 steps
+                    row = indices[b, step].item() // 16
+                    col = indices[b, step].item() % 16
 
-                dt = args.t_noise / args.n_steps
-                for s in range(args.n_steps):
-                    t_cur = args.t_noise - s * dt
-                    t_vec = torch.full((batch,), t_cur, device=device, dtype=torch.float32)
-                    y_null = torch.full((batch,), dit.y_embedder.num_classes, dtype=torch.long, device=device)
-                    v     = dit(z_t, t_vec, y_null) # unconditional
-                    z_t   = z_t - v * dt
+                    z_i              = torch.zeros_like(z_full)
+                    z_i[:, :, row, col] = z_full[:, :, row, col]
 
-                local_clean = z_t
-                global_token = global_token + local_clean
-                local_token = local_clean
+                    local_token = local_token + z_i
+                    local_norm  = local_token / (step + 1)
 
-        global_avg = global_token / crops.shape[1]
+                    noise = torch.randn_like(local_norm)
+                    z_t   = (1 - args.t_noise) * local_norm + args.t_noise * noise
 
-        x_reconstructed = rae.decode(global_avg).clamp(0, 1)
-        x_reconstructed = F.interpolate(x_reconstructed, size=(224, 224), mode='bicubic', align_corners=False)
+                    dt = args.t_noise / args.n_steps
+                    for s in range(args.n_steps):
+                        t_cur = args.t_noise - s * dt
+                        t_vec = torch.full((1,), t_cur, device=device, dtype=torch.float32)
+                        v     = dit(z_t, t_vec, y_null)
+                        z_t   = z_t - v * dt
 
-        logits = classifier(x_reconstructed)
-        preds  = logits.argmax(dim=1)
-        correct = (preds == labels).sum().item()
-        print(f'batch {i}: accuracy = {correct}/{batch}')
+                    local_clean  = z_t
+                    global_token = global_token + local_clean
+                    local_token  = local_clean
+
+                global_avg      = global_token / indices.shape[1]
+                x_reconstructed = rae.decode(global_avg).clamp(0, 1)
+                x_reconstructed = F.interpolate(x_reconstructed, size=(224, 224), mode='bicubic', align_corners=False)
+                logits = classifier(x_reconstructed)
+                results.append(logits.argmax(dim=1))
+                torch.cuda.empty_cache()
+
+            preds = torch.cat(results)
+            torch.cuda.empty_cache()
+            print(f'batch {i}: accuracy = {(preds == labels).sum().item()}/{batch}')
+            total += batch
 
     # adversary.apgd.eot_iter    = 1
     # adversary.apgd.n_iter      = 10
