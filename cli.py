@@ -26,7 +26,7 @@ p.add_argument('--eps',          type=float, default=8/255)
 p.add_argument('--batch-size',   type=int,   default=16)
 p.add_argument('--n-samples',    type=int,   default=None)
 p.add_argument('--n-batches',    type=int,   default=None)
-p.add_argument('--crop-size', type=int, default=84)
+p.add_argument('--crop-size',    type=int,   default=84)
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -67,10 +67,49 @@ if __name__ == "__main__":
     dit = dit.to(device).eval()
 
     purified_model = PurifiedClassifier(rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps).to(device).eval()
-
     adversary = AutoAttack(purified_model, norm='Linf', eps=args.eps, version='rand', device=str(device), verbose=False)
 
+    y_null = torch.full((1,), dit.y_embedder.num_classes, dtype=torch.long, device=device)
+
+    @torch.no_grad()
+    def purify_batch(imgs: torch.Tensor) -> torch.Tensor:
+        results = []
+
+        for b in range(imgs.shape[0]):
+            global_token = torch.zeros(1, 768, 16, 16, device=device)
+
+            # encode full image once — dense latent, no sparse masking
+            z_full = rae.encode(imgs[b:b+1])
+            local  = z_full.clone()
+
+            for step in range(10):                          # k=10 refinement steps
+                noise = torch.randn_like(local)
+                z_t   = (1 - args.t_noise) * local + args.t_noise * noise
+
+                dt = args.t_noise / args.n_steps
+                for s in range(args.n_steps):
+                    t_cur = args.t_noise - s * dt
+                    t_vec = torch.full((1,), t_cur, device=device, dtype=torch.float32)
+                    v     = dit(z_t, t_vec, y_null)
+                    z_t   = z_t - v * dt
+
+                local_clean  = z_t
+                global_token = global_token + local_clean
+                local        = local_clean                  # next step refines from this
+
+            global_avg = global_token / 10
+            x_rec      = rae.decode(global_avg).clamp(0, 1)
+            x_rec      = F.interpolate(x_rec, size=(224, 224),
+                                    mode='bicubic', align_corners=False)
+            results.append(classifier(x_rec).argmax(dim=1))
+            torch.cuda.empty_cache()
+
+        return torch.cat(results)
+        
+    correct_clean  = 0
+    correct_robust = 0
     total = 0
+
     for i, (images, labels) in enumerate(tqdm(test_loader, desc='eval')):
         if args.n_batches is not None and i >= args.n_batches:
             break
@@ -79,85 +118,21 @@ if __name__ == "__main__":
 
         images = images.to(device)
         labels = labels.to(device)
-        batch = images.shape[0]
+        batch  = images.shape[0]
 
-        indices, attn = topk_patches(images, dinov2, k=10)
-        # crops = extract_crops(images, indices, crop_size=args.crop_size)  # (batch, 10, 3, 224, 224)
+        preds_clean = purify_batch(images)
+        n_clean     = (preds_clean == labels).sum().item()
 
-        local_token  = torch.zeros(batch, 768, 16, 16, device=device)
-        global_token = torch.zeros(batch, 768, 16, 16, device=device)
+        x_adv        = adversary.run_standard_evaluation(images, labels, bs=batch)
+        preds_robust = purify_batch(x_adv)
+        n_robust     = (preds_robust == labels).sum().item()
 
-        with torch.no_grad():
-            results = []
-            y_null  = torch.full((1,), dit.y_embedder.num_classes,
-                                  dtype=torch.long, device=device)
+        correct_clean  += n_clean
+        correct_robust += n_robust
+        total          += batch
 
-            for b in range(batch):
-                local_token  = torch.zeros(1, 768, 16, 16, device=device)
-                global_token = torch.zeros(1, 768, 16, 16, device=device)
-                z_full       = rae.encode(images[b:b+1])   # (1, 768, 16, 16)
+        print(f'batch {i}: clean {n_clean}/{batch}  robust {n_robust}/{batch}')
 
-                for step in range(indices.shape[1]):        # k=10 steps
-                    row = indices[b, step].item() // 16
-                    col = indices[b, step].item() % 16
-
-                    z_i              = torch.zeros_like(z_full)
-                    z_i[:, :, row, col] = z_full[:, :, row, col]
-
-                    local_token = local_token + z_i
-                    local_norm  = local_token / (step + 1)
-
-                    noise = torch.randn_like(local_norm)
-                    z_t   = (1 - args.t_noise) * local_norm + args.t_noise * noise
-
-                    dt = args.t_noise / args.n_steps
-                    for s in range(args.n_steps):
-                        t_cur = args.t_noise - s * dt
-                        t_vec = torch.full((1,), t_cur, device=device, dtype=torch.float32)
-                        v     = dit(z_t, t_vec, y_null)
-                        z_t   = z_t - v * dt
-
-                    local_clean  = z_t
-                    global_token = global_token + local_clean
-                    local_token  = local_clean
-
-                global_avg      = global_token / indices.shape[1]
-                x_reconstructed = rae.decode(global_avg).clamp(0, 1)
-                x_reconstructed = F.interpolate(x_reconstructed, size=(224, 224), mode='bicubic', align_corners=False)
-                logits = classifier(x_reconstructed)
-                results.append(logits.argmax(dim=1))
-                torch.cuda.empty_cache()
-
-            preds = torch.cat(results)
-            torch.cuda.empty_cache()
-            print(f'batch {i}: accuracy = {(preds == labels).sum().item()}/{batch}')
-            total += batch
-
-    # adversary.apgd.eot_iter    = 1
-    # adversary.apgd.n_iter      = 10
-    # adversary.apgd.n_restarts  = 1
-
-    # correct = {'clean': 0, 'clean_purified': 0, 'adv': 0, 'adv_purified': 0}
-
-    # for i, (images, labels) in enumerate(tqdm(test_loader, desc='eval')):
-    #     if args.n_batches is not None and i >= args.n_batches:
-    #         break
-    #     if args.n_samples is not None and total >= args.n_samples:
-    #         break
-    #     images, labels = images.to(device), labels.to(device)
-
-    #     with torch.no_grad():
-    #         correct['clean']          += (classifier(images).argmax(1) == labels).sum().item()
-    #         correct['clean_purified'] += (classifier(purify(rae, dit, images, args.t_noise, args.n_steps)).argmax(1) == labels).sum().item()
-
-    #     x_adv = adversary.run_standard_evaluation(images, labels, bs=len(images))
-
-    #     with torch.no_grad():
-    #         correct['adv']          += (classifier(x_adv).argmax(1) == labels).sum().item()
-    #         correct['adv_purified'] += (classifier(purify(rae, dit, x_adv, args.t_noise, args.n_steps)).argmax(1) == labels).sum().item()
-
-    #     total += labels.size(0)
-
-    # print()
-    # for k, v in correct.items():
-    #     print(f'{k:16s} accuracy: {v / total * 100:.2f}%')
+    print()
+    print(f'clean  accuracy: {correct_clean  / total * 100:.2f}%  ({correct_clean}/{total})')
+    print(f'robust accuracy: {correct_robust / total * 100:.2f}%  ({correct_robust}/{total})')
