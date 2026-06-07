@@ -2,19 +2,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
-def purify(rae, dit, x, t_noise, n_steps):
-    z = rae.encode(x)                                              # (B, 768, 16, 16)
-    noise = torch.randn_like(z)
-    z_t = (1 - t_noise) * z + t_noise * noise                     # forward to t_noise
-    y_null = torch.full((x.shape[0],), 1000, dtype=torch.long, device=x.device)
-    dt = t_noise / n_steps
-    with torch.no_grad():
-        for i in range(n_steps):
-            t_vec = torch.full((x.shape[0],), t_noise - i * dt, device=x.device)
-            z_t = z_t - dit(z_t, t_vec, y_null) * dt              # Euler reverse step
-    x_rec = rae.decode(z_t).clamp(0, 1)
-    return F.interpolate(x_rec, size=x.shape[-2:], mode='bicubic', align_corners=False)
-
 class DINO_classification(nn.Module):
     def __init__(self, dinov2, prototypes, normalize):
         super().__init__()
@@ -30,16 +17,50 @@ class DINO_classification(nn.Module):
         return logits
 
 class PurifiedClassifier(nn.Module):
-    def __init__(self, rae, dit, classifier, t_noise, n_steps):
+    def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10):
         super().__init__()
         self.rae        = rae
         self.dit        = dit
         self.classifier = classifier
         self.t_noise    = t_noise
         self.n_steps    = n_steps
+        self.k          = k
 
     def forward(self, x):
-        x_purified = purify(self.rae, self.dit, x, self.t_noise, self.n_steps)
-        # BPDA: forward uses purified image, backward is straight-through (identity)
-        x_bpda = x + (x_purified - x).detach()
-        return self.classifier(x_bpda)
+        B      = x.shape[0]
+        device = x.device
+        y_null = torch.full((1,), self.dit.y_embedder.num_classes,
+                             dtype=torch.long, device=device)
+        logits_list = []
+
+        for b in range(B):
+            global_token = torch.zeros(1, 768, 16, 16, device=device)
+            
+            with torch.no_grad():
+                z_full = self.rae.encode(x[b:b+1])
+                local  = z_full.clone()
+                for step in range(self.k):
+                    noise = torch.randn_like(local)
+                    z_t   = (1 - self.t_noise) * local + self.t_noise * noise
+
+                    dt = self.t_noise / self.n_steps
+                    for s in range(self.n_steps):
+                        t_cur = self.t_noise - s * dt
+                        t_vec = torch.full((1,), t_cur, device=device, dtype=torch.float32)
+                        v     = self.dit(z_t, t_vec, y_null)
+                        z_t   = z_t - v * dt
+
+                    local_clean  = z_t
+                    global_token = global_token + local_clean
+                    local        = local_clean
+
+            global_avg = global_token / self.k
+            x_rec      = self.rae.decode(global_avg).clamp(0, 1)
+            x_rec      = F.interpolate(x_rec, size=(224, 224),
+                                       mode='bicubic', align_corners=False)
+
+            # BPDA: forward uses purified, backward is straight-through
+            x_bpda = x[b:b+1] + (x_rec - x[b:b+1]).detach()
+            logits_list.append(self.classifier(x_bpda))
+
+        return torch.cat(logits_list)   # (B, 10) logits

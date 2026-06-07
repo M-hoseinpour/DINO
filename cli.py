@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from autoattack import AutoAttack
-from classifier import DINO_classification, PurifiedClassifier, purify
+from classifier import DINO_classification, PurifiedClassifier
 from consts import DECODER_PATH, DIT_PATH, STATS_PATH
 from data import cifar10_loader
 from utils import ensure_weights, extract_crops, load_prototypes, normalize, seed_eveything, topk_patches
@@ -21,7 +21,7 @@ p.add_argument('--decoder-path', default=DECODER_PATH)
 p.add_argument('--stats-path',   default=STATS_PATH)
 p.add_argument('--dit-path',     default=DIT_PATH)
 p.add_argument('--t-noise',      type=float, default=0.3)
-p.add_argument('--n-steps',      type=int,   default=20)
+p.add_argument('--n-steps',      type=int,   default=10)
 p.add_argument('--eps',          type=float, default=8/255)
 p.add_argument('--batch-size',   type=int,   default=16)
 p.add_argument('--n-samples',    type=int,   default=None)
@@ -66,46 +66,22 @@ if __name__ == "__main__":
     dit.load_state_dict(torch.load(args.dit_path, map_location='cpu'))
     dit = dit.to(device).eval()
 
-    purified_model = PurifiedClassifier(rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps).to(device).eval()
-    adversary = AutoAttack(purified_model, norm='Linf', eps=args.eps, version='rand', device=str(device), verbose=False)
+    purified_model = PurifiedClassifier(rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=5).to(device).eval()
+    adversary = AutoAttack(purified_model, norm='Linf', eps=args.eps, version='rand', device=str(device), verbose=True)
+    adversary.attacks_to_run  = ['apgd-ce', 'apgd-dlr', 'square']
 
-    y_null = torch.full((1,), dit.y_embedder.num_classes, dtype=torch.long, device=device)
+    # white-box settings
+    adversary.apgd.eot_iter   = 20
+    adversary.apgd.n_iter     = 100
+    adversary.apgd.n_restarts = 1
 
-    @torch.no_grad()
-    def purify_batch(imgs: torch.Tensor) -> torch.Tensor:
-        results = []
+    adversary.apgd_targeted.eot_iter   = 20
+    adversary.apgd_targeted.n_iter     = 100
+    adversary.apgd_targeted.n_restarts = 1
 
-        for b in range(imgs.shape[0]):
-            global_token = torch.zeros(1, 768, 16, 16, device=device)
+    # black-box settings
+    adversary.square.n_queries = 5000
 
-            # encode full image once — dense latent, no sparse masking
-            z_full = rae.encode(imgs[b:b+1])
-            local  = z_full.clone()
-
-            for step in range(10):                          # k=10 refinement steps
-                noise = torch.randn_like(local)
-                z_t   = (1 - args.t_noise) * local + args.t_noise * noise
-
-                dt = args.t_noise / args.n_steps
-                for s in range(args.n_steps):
-                    t_cur = args.t_noise - s * dt
-                    t_vec = torch.full((1,), t_cur, device=device, dtype=torch.float32)
-                    v     = dit(z_t, t_vec, y_null)
-                    z_t   = z_t - v * dt
-
-                local_clean  = z_t
-                global_token = global_token + local_clean
-                local        = local_clean                  # next step refines from this
-
-            global_avg = global_token / 10
-            x_rec      = rae.decode(global_avg).clamp(0, 1)
-            x_rec      = F.interpolate(x_rec, size=(224, 224),
-                                    mode='bicubic', align_corners=False)
-            results.append(classifier(x_rec).argmax(dim=1))
-            torch.cuda.empty_cache()
-
-        return torch.cat(results)
-        
     correct_clean  = 0
     correct_robust = 0
     total = 0
@@ -120,11 +96,13 @@ if __name__ == "__main__":
         labels = labels.to(device)
         batch  = images.shape[0]
 
-        preds_clean = purify_batch(images)
+        with torch.no_grad():
+            preds_clean = purified_model(images).argmax(dim=1)
         n_clean     = (preds_clean == labels).sum().item()
 
         x_adv        = adversary.run_standard_evaluation(images, labels, bs=batch)
-        preds_robust = purify_batch(x_adv)
+        with torch.no_grad():
+            preds_robust = purified_model(x_adv).argmax(dim=1)
         n_robust     = (preds_robust == labels).sum().item()
 
         correct_clean  += n_clean
