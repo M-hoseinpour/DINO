@@ -19,18 +19,17 @@ class DINO_classification(nn.Module):
 class PurifiedClassifier(nn.Module):
     def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10):
         super().__init__()
-        self.rae        = rae
-        self.dit        = dit
+        self.rae = rae
+        self.dit = dit
         self.classifier = classifier
-        self.t_noise    = t_noise
-        self.n_steps    = n_steps
-        self.k          = k
+        self.t_noise = t_noise
+        self.n_steps = n_steps
+        self.k = k
 
     def forward(self, x):
-        B      = x.shape[0]
+        B = x.shape[0]
         device = x.device
-        y_null = torch.full((1,), self.dit.y_embedder.num_classes,
-                             dtype=torch.long, device=device)
+        y_null = torch.full((1,), self.dit.y_embedder.num_classes, dtype=torch.long, device=device)
         logits_list = []
 
         for b in range(B):
@@ -56,8 +55,7 @@ class PurifiedClassifier(nn.Module):
 
             global_avg = global_token / self.k
             x_rec      = self.rae.decode(global_avg).clamp(0, 1)
-            x_rec      = F.interpolate(x_rec, size=(224, 224),
-                                       mode='bicubic', align_corners=False)
+            x_rec      = F.interpolate(x_rec, size=(224, 224), mode='bicubic', align_corners=False)
 
             # BPDA: forward uses purified, backward is straight-through
             x_bpda = x[b:b+1] + (x_rec - x[b:b+1]).detach()

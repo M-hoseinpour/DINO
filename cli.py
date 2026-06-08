@@ -1,3 +1,4 @@
+import os
 import sys
 import argparse
 from pathlib import Path
@@ -10,7 +11,7 @@ from autoattack import AutoAttack
 from classifier import DINO_classification, PurifiedClassifier
 from consts import DECODER_PATH, DIT_PATH, STATS_PATH
 from data import cifar10_loader
-from utils import ensure_weights, extract_crops, load_prototypes, normalize, seed_eveything, topk_patches
+from utils import ensure_weights, extract_crops, load_prototypes, normalize, seed_eveything
 
 sys.path.insert(0, str(Path(__file__).parent / 'RAE' / 'src'))
 from stage1.rae import RAE
@@ -20,7 +21,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--decoder-path', default=DECODER_PATH)
 p.add_argument('--stats-path',   default=STATS_PATH)
 p.add_argument('--dit-path',     default=DIT_PATH)
-p.add_argument('--t-noise',      type=float, default=0.3)
+p.add_argument('--t-noise',      type=float, default=0.95)
 p.add_argument('--n-steps',      type=int,   default=10)
 p.add_argument('--eps',          type=float, default=8/255)
 p.add_argument('--batch-size',   type=int,   default=16)
@@ -66,51 +67,71 @@ if __name__ == "__main__":
     dit.load_state_dict(torch.load(args.dit_path, map_location='cpu'))
     dit = dit.to(device).eval()
 
-    purified_model = PurifiedClassifier(rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=5).to(device).eval()
-    adversary = AutoAttack(purified_model, norm='Linf', eps=args.eps, version='rand', device=str(device), verbose=True)
-    adversary.attacks_to_run  = ['apgd-ce', 'apgd-dlr', 'square']
+    purified_model = PurifiedClassifier(
+        rae, dit, classifier,
+        t_noise=args.t_noise, n_steps=args.n_steps, k=5
+    ).to(device).eval()
 
-    # white-box settings
-    adversary.apgd.eot_iter   = 20
-    adversary.apgd.n_iter     = 100
-    adversary.apgd.n_restarts = 1
+    adversary = AutoAttack(
+        purified_model, norm='Linf', eps=args.eps,
+        version='rand', device=str(device), verbose=True,
+        log_path='attack_log.txt'
+    )
+    adversary.attacks_to_run       = ['apgd-ce', 'apgd-dlr', 'square']
 
-    adversary.apgd_targeted.eot_iter   = 20
-    adversary.apgd_targeted.n_iter     = 100
+    adversary.apgd.eot_iter        = 20
+    adversary.apgd.n_iter          = 100
+    adversary.apgd.n_restarts      = 1
+
+    adversary.apgd_targeted.eot_iter  = 20
+    adversary.apgd_targeted.n_iter    = 100
     adversary.apgd_targeted.n_restarts = 1
 
-    # black-box settings
-    adversary.square.n_queries = 5000
+    adversary.square.n_queries     = 5000
 
-    correct_clean  = 0
-    correct_robust = 0
-    total = 0
-
-    for i, (images, labels) in enumerate(tqdm(test_loader, desc='eval')):
-        if args.n_batches is not None and i >= args.n_batches:
-            break
-        if args.n_samples is not None and total >= args.n_samples:
+    n_eval = args.n_samples or 512
+    x_all, y_all = [], []
+    for images, labels in test_loader:
+        x_all.append(images)
+        y_all.append(labels)
+        if sum(x.shape[0] for x in x_all) >= n_eval:
             break
 
-        images = images.to(device)
-        labels = labels.to(device)
-        batch  = images.shape[0]
+    x_test = torch.cat(x_all)[:n_eval].to(device)
+    y_test = torch.cat(y_all)[:n_eval].to(device)
+    print(f'Loaded {len(x_test)} test samples')
 
-        with torch.no_grad():
-            preds_clean = purified_model(images).argmax(dim=1)
-        n_clean     = (preds_clean == labels).sum().item()
+    ckpt_dir = f'ckpt_eps{int(args.eps*255)}_n{n_eval}'
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-        x_adv        = adversary.run_standard_evaluation(images, labels, bs=batch)
-        with torch.no_grad():
-            preds_robust = purified_model(x_adv).argmax(dim=1)
-        n_robust     = (preds_robust == labels).sum().item()
+    chunk_size = args.batch_size
+    all_y_adv  = []
+    all_labels = []
 
-        correct_clean  += n_clean
-        correct_robust += n_robust
-        total          += batch
+    for start in range(0, n_eval, chunk_size):
+        end        = min(start + chunk_size, n_eval)
+        ckpt_path  = os.path.join(ckpt_dir, f'chunk_{start:04d}_{end:04d}.pt')
 
-        print(f'batch {i}: clean {n_clean}/{batch}  robust {n_robust}/{batch}')
+        if os.path.exists(ckpt_path):
+            print(f'[resume] chunk {start}-{end}')
+            ckpt = torch.load(ckpt_path, map_location='cpu')
+            all_y_adv.append(ckpt['y_adv'])
+            all_labels.append(ckpt['labels'])
+            continue
 
-    print()
-    print(f'clean  accuracy: {correct_clean  / total * 100:.2f}%  ({correct_clean}/{total})')
-    print(f'robust accuracy: {correct_robust / total * 100:.2f}%  ({correct_robust}/{total})')
+        x_chunk = x_test[start:end]
+        y_chunk = y_test[start:end]
+
+        x_adv_chunk, y_adv_chunk = adversary.run_standard_evaluation(x_chunk, y_chunk, bs=len(x_chunk), return_labels=True)
+
+        torch.save({ 'y_adv':  y_adv_chunk.cpu(), 'labels': y_chunk.cpu() }, ckpt_path)
+
+        all_y_adv.append(y_adv_chunk.cpu())
+        all_labels.append(y_chunk.cpu())
+        print(f'[saved] chunk {start}-{end}')
+
+    y_adv_all  = torch.cat(all_y_adv)
+    labels_all = torch.cat(all_labels)
+    correct    = (y_adv_all == labels_all).sum().item()
+
+    print(f'\nrobust accuracy: {correct / len(labels_all) * 100:.2f}%' f'  ({correct}/{len(labels_all)})')

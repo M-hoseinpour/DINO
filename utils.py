@@ -78,30 +78,6 @@ def load_prototypes(device, train_loader, normalize, dinov2):
         torch.save(prototypes, PROTOTYPE_PATH)
     return prototypes
 
-def topk_patches(x, dinov2, k=10):
-    attn_list = []
-    def hook(module, input, _output):
-        batch, num_toknes, embedding_dim = input[0].shape
-        num_heads = module.num_heads
-        head_dim  = embedding_dim // num_heads
-        qkv = module.qkv(input[0]).reshape(batch, num_toknes, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, kk, _ = qkv.unbind(0)
-
-        attn = (q @ kk.transpose(-2, -1)) * (head_dim ** -0.5)
-        attn = attn.softmax(dim=-1)
-        attn_list.append(attn.detach())
-
-    handle = dinov2.blocks[-1].attn.register_forward_hook(hook)
-    with torch.no_grad():
-        dinov2(normalize(x))
-    handle.remove()
-
-    cls_attn = attn_list[0][:, :, 0, 1:]  # (batch, num_heads, 256)
-    cls_attn = cls_attn.mean(dim=1)       # (batch, 256) — average over heads
-
-    topk_indices = cls_attn.topk(k, dim=-1).indices  # (batch, k)
-    return topk_indices, cls_attn
-
 def extract_crops(x, topk_indices, crop_size=84, target_size=224):
     """
     x:             (batch, 3, 224, 224)
