@@ -80,6 +80,8 @@ if __name__ == "__main__":
     )
     adversary.attacks_to_run       = ['apgd-ce', 'apgd-dlr', 'square']
 
+    adversary.seed = 0
+
     adversary.apgd.eot_iter        = 20
     adversary.apgd.n_iter          = 100
     adversary.apgd.n_restarts      = 1

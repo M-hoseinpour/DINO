@@ -36,39 +36,32 @@ class PurifiedClassifier(nn.Module):
         self.weights = w / w.sum()
 
     def forward(self, x):
-        B = x.shape[0]
+        B      = x.shape[0]
         device = x.device
-        y_null = torch.full((1,), self.dit.y_embedder.num_classes, dtype=torch.long, device=device)
-        logits_list = []
+        y_null = torch.full((B,), self.dit.y_embedder.num_classes, dtype=torch.long, device=device)
 
-        for b in range(B):
-            global_token = torch.zeros(1, 768, 16, 16, device=device)
-            
-            with torch.no_grad():
-                z_full = self.rae.encode(x[b:b+1])
-                local  = z_full.clone()
-                for step in range(self.k):
-                    noise = torch.randn_like(local)
-                    z_t   = (1 - self.t_noise) * local + self.t_noise * noise
+        global_token = torch.zeros(B, 768, 16, 16, device=device)
+        z_full = self.rae.encode(x)
+        local  = z_full.clone()
 
-                    dt = self.t_noise / self.n_steps
-                    for s in range(self.n_steps):
-                        t_cur = self.t_noise - s * dt
-                        t_vec = torch.full((1,), t_cur, device=device, dtype=torch.float32)
-                        v     = self.dit(z_t, t_vec, y_null)
-                        z_t   = z_t - v * dt
+        with torch.no_grad():
+            for step in range(self.k):
+                noise = torch.randn_like(local)
+                z_t   = (1 - self.t_noise) * local + self.t_noise * noise
 
-                    local_clean  = z_t
-                    global_token = global_token + self.weights[step].to(device) * local_clean
-                    local        = local_clean
+                dt = self.t_noise / self.n_steps
+                for s in range(self.n_steps):
+                    t_cur = self.t_noise - s * dt
+                    t_vec = torch.full((B,), t_cur, device=device, dtype=torch.float32)
+                    v     = self.dit(z_t, t_vec, y_null)
+                    z_t   = z_t - v * dt
 
-            global_avg = global_token
-            # global_avg = global_token / self.k
-            x_rec      = self.rae.decode(global_avg).clamp(0, 1)
-            x_rec      = F.interpolate(x_rec, size=(224, 224), mode='bicubic', align_corners=False)
+                local_clean  = z_t
+                global_token = global_token + self.weights[step].to(device) * local_clean
+                local        = local_clean
 
-            # BPDA: forward uses purified, backward is straight-through
-            x_bpda = x[b:b+1] + (x_rec - x[b:b+1]).detach()
-            logits_list.append(self.classifier(x_bpda))
+        x_rec = self.rae.decode(global_token).clamp(0, 1)
+        x_rec = F.interpolate(x_rec, size=(224, 224), mode='bicubic', align_corners=False)
 
-        return torch.cat(logits_list)   # (B, 10) logits
+        x_bpda = x + (x_rec - x).detach()
+        return self.classifier(x_bpda)
