@@ -22,12 +22,14 @@ p.add_argument('--decoder-path', default=DECODER_PATH)
 p.add_argument('--stats-path',   default=STATS_PATH)
 p.add_argument('--dit-path',     default=DIT_PATH)
 p.add_argument('--t-noise',      type=float, default=0.95)
-p.add_argument('--n-steps',      type=int,   default=10)
+p.add_argument('--n-steps',      type=int,   default=3)
 p.add_argument('--eps',          type=float, default=8/255)
 p.add_argument('--batch-size',   type=int,   default=16)
 p.add_argument('--n-samples',    type=int,   default=None)
 p.add_argument('--n-batches',    type=int,   default=None)
 p.add_argument('--crop-size',    type=int,   default=84)
+p.add_argument('--topk',    type=int,   default=5)
+p.add_argument('--weight-scheme', type=str, default='equal', choices=['equal', 'increasing', 'decreasing'])
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -68,8 +70,7 @@ if __name__ == "__main__":
     dit = dit.to(device).eval()
 
     purified_model = PurifiedClassifier(
-        rae, dit, classifier,
-        t_noise=args.t_noise, n_steps=args.n_steps, k=5
+        rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk, weight_scheme=args.weight_scheme
     ).to(device).eval()
 
     adversary = AutoAttack(
@@ -101,7 +102,7 @@ if __name__ == "__main__":
     y_test = torch.cat(y_all)[:n_eval].to(device)
     print(f'Loaded {len(x_test)} test samples')
 
-    ckpt_dir = f'ckpt_eps{int(args.eps*255)}_n{n_eval}'
+    ckpt_dir = f'ckpt_eps{int(args.eps*255)}_n{n_eval}_top{args.topk}k_{args.n_steps}steps_{args.weight_scheme}'
     os.makedirs(ckpt_dir, exist_ok=True)
 
     chunk_size = args.batch_size

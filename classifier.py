@@ -17,7 +17,7 @@ class DINO_classification(nn.Module):
         return logits
 
 class PurifiedClassifier(nn.Module):
-    def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10):
+    def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10, weight_scheme='equal'):
         super().__init__()
         self.rae = rae
         self.dit = dit
@@ -25,6 +25,15 @@ class PurifiedClassifier(nn.Module):
         self.t_noise = t_noise
         self.n_steps = n_steps
         self.k = k
+        self.weight_scheme = weight_scheme
+
+        w = torch.ones(k)
+        if weight_scheme == 'increasing':
+            w = torch.arange(1, k+1, dtype=torch.float32)
+        elif weight_scheme == 'decreasing':
+            w = torch.arange(k, 0, -1, dtype=torch.float32)
+
+        self.weights = w / w.sum()
 
     def forward(self, x):
         B = x.shape[0]
@@ -50,10 +59,11 @@ class PurifiedClassifier(nn.Module):
                         z_t   = z_t - v * dt
 
                     local_clean  = z_t
-                    global_token = global_token + local_clean
+                    global_token = global_token + self.weights[step].to(device) * local_clean
                     local        = local_clean
 
-            global_avg = global_token / self.k
+            global_avg = global_token
+            # global_avg = global_token / self.k
             x_rec      = self.rae.decode(global_avg).clamp(0, 1)
             x_rec      = F.interpolate(x_rec, size=(224, 224), mode='bicubic', align_corners=False)
 
