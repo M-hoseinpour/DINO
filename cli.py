@@ -30,6 +30,8 @@ p.add_argument('--n-batches',    type=int,   default=None)
 p.add_argument('--crop-size',    type=int,   default=84)
 p.add_argument('--topk',    type=int,   default=5)
 p.add_argument('--weight-scheme', type=str, default='equal', choices=['equal', 'increasing', 'decreasing'])
+p.add_argument('--start-idx', type=int, default=0,    help='Start sample index')
+p.add_argument('--end-idx',   type=int, default=None, help='End sample index (exclusive)')
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -73,26 +75,24 @@ if __name__ == "__main__":
         rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk, weight_scheme=args.weight_scheme
     ).to(device).eval()
 
+    n_eval = args.n_samples or 512
+    start_idx = args.start_idx
+    end_idx   = args.end_idx if args.end_idx is not None else n_eval
+
     adversary = AutoAttack(
         purified_model, norm='Linf', eps=args.eps,
         version='rand', device=str(device), verbose=True,
-        log_path='attack_log.txt'
+        log_path=f'attack_log_{start_idx}_{end_idx}.txt'
     )
     adversary.attacks_to_run       = ['apgd-ce', 'apgd-dlr', 'square']
-
     adversary.seed = 0
 
     adversary.apgd.eot_iter        = 20
     adversary.apgd.n_iter          = 100
     adversary.apgd.n_restarts      = 1
 
-    adversary.apgd_targeted.eot_iter  = 20
-    adversary.apgd_targeted.n_iter    = 100
-    adversary.apgd_targeted.n_restarts = 1
-
     adversary.square.n_queries     = 5000
 
-    n_eval = args.n_samples or 512
     x_all, y_all = [], []
     for images, labels in test_loader:
         x_all.append(images)
@@ -104,15 +104,17 @@ if __name__ == "__main__":
     y_test = torch.cat(y_all)[:n_eval].to(device)
     print(f'Loaded {len(x_test)} test samples')
 
-    ckpt_dir = f'ckpt_eps{int(args.eps*255)}_n{n_eval}_top{args.topk}k_{args.n_steps}steps_{args.weight_scheme}'
+    print(f'Processing samples {start_idx} to {end_idx}')
+
+    ckpt_dir = f'ckpt_eps{int(args.eps*255)}_n{n_eval}_top{args.topk}k_{args.n_steps}steps_{args.weight_scheme}_iter{adversary.apgd.n_iter}_eot{adversary.apgd.eot_iter}'
     os.makedirs(ckpt_dir, exist_ok=True)
 
     chunk_size = args.batch_size
     all_y_adv  = []
     all_labels = []
 
-    for start in range(0, n_eval, chunk_size):
-        end        = min(start + chunk_size, n_eval)
+    for start in range(start_idx, end_idx, chunk_size):
+        end        = min(start + chunk_size, end_idx)
         ckpt_path  = os.path.join(ckpt_dir, f'chunk_{start:04d}_{end:04d}.pt')
 
         if os.path.exists(ckpt_path):
@@ -137,4 +139,4 @@ if __name__ == "__main__":
     labels_all = torch.cat(all_labels)
     correct    = (y_adv_all == labels_all).sum().item()
 
-    print(f'\nrobust accuracy: {correct / len(labels_all) * 100:.2f}%' f'  ({correct}/{len(labels_all)})')
+    print(f'\n [GPU {start_idx}-{end_idx}] robust accuracy: {correct / len(labels_all) * 100:.2f}%' f'  ({correct}/{len(labels_all)})')
