@@ -32,6 +32,7 @@ p.add_argument('--topk',    type=int,   default=5)
 p.add_argument('--weight-scheme', type=str, default='equal', choices=['equal', 'increasing', 'decreasing'])
 p.add_argument('--start-idx', type=int, default=0,    help='Start sample index')
 p.add_argument('--end-idx',   type=int, default=None, help='End sample index (exclusive)')
+p.add_argument('--neighborhood-radius', type=int, default=3, help='Radius of neighborhood around attended position (1=3x3, 2=5x5)')
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -72,7 +73,9 @@ if __name__ == "__main__":
     dit = dit.to(device).eval()
 
     purified_model = PurifiedClassifier(
-        rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk, weight_scheme=args.weight_scheme
+        rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk,
+        weight_scheme=args.weight_scheme,
+        neighborhood_radius=args.neighborhood_radius
     ).to(device).eval()
 
     n_eval = args.n_samples or 512
@@ -106,7 +109,7 @@ if __name__ == "__main__":
 
     print(f'Processing samples {start_idx} to {end_idx}')
 
-    ckpt_dir = f'ckpt_eps{int(args.eps*255)}_n{n_eval}_top{args.topk}k_{args.n_steps}steps_{args.weight_scheme}_iter{adversary.apgd.n_iter}_eot{adversary.apgd.eot_iter}'
+    ckpt_dir = f'ckpt_eps{int(args.eps*255)}_n{n_eval}_top{args.topk}k_{args.n_steps}steps_{args.weight_scheme}_iter{adversary.apgd.n_iter}_eot{adversary.apgd.eot_iter}_noise{args.t_noise}'
     os.makedirs(ckpt_dir, exist_ok=True)
 
     chunk_size = args.batch_size
