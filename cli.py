@@ -26,8 +26,6 @@ p.add_argument('--n-steps',      type=int,   default=3)
 p.add_argument('--eps',          type=float, default=8/255)
 p.add_argument('--batch-size',   type=int,   default=16)
 p.add_argument('--n-samples',    type=int,   default=None)
-p.add_argument('--n-batches',    type=int,   default=None)
-p.add_argument('--crop-size',    type=int,   default=84)
 p.add_argument('--topk',    type=int,   default=5)
 p.add_argument('--weight-scheme', type=str, default='equal', choices=['equal', 'increasing', 'decreasing'])
 p.add_argument('--start-idx', type=int, default=0,    help='Start sample index')
@@ -75,7 +73,7 @@ if __name__ == "__main__":
     purified_model = PurifiedClassifier(
         rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk,
         weight_scheme=args.weight_scheme,
-        neighborhood_radius=args.neighborhood_radius
+        neighborhood_radius=args.neighborhood_radius,
     ).to(device).eval()
 
     n_eval = args.n_samples or 512

@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-
+    
 class DINO_classification(nn.Module):
     def __init__(self, dinov2, prototypes, normalize):
         super().__init__()
@@ -27,35 +27,43 @@ def get_neighborhood(row, col, grid_size=16, radius=1):
     return positions
 
 def topk_patches(x, dinov2, k):
-    B = x.shape[0]
+    B    = x.shape[0]
     mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1,3,1,1)
     std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1,3,1,1)
     x_norm = (x - mean) / std
 
-    # attn_drop is a raw float in this build, not an nn.Module — hook qkv instead.
-    # Use a list container so static analysers can track the mutation (nonlocal fools them).
     qkv_holder: list[torch.Tensor] = []
     def hook(_module, _input, output):
-        qkv_holder.append(output)  # (B, N+1, 3*dim)
+        qkv_holder.append(output)
 
     last_attn = dinov2.blocks[-1].attn
-    handle = last_attn.qkv.register_forward_hook(hook)
+    handle    = last_attn.qkv.register_forward_hook(hook)
     with torch.no_grad():
         dinov2(x_norm)
     handle.remove()
 
-    qkv_out = qkv_holder[0]
-    N_plus1 = qkv_out.shape[1]
+    qkv_out  = qkv_holder[0]
+    N_plus1  = qkv_out.shape[1]
     H        = last_attn.num_heads
     head_dim = qkv_out.shape[2] // 3 // H
-    qkv = qkv_out.reshape(B, N_plus1, 3, H, head_dim)
-    q, kk = qkv[:, :, 0].transpose(1, 2), qkv[:, :, 1].transpose(1, 2)  # (B, H, N+1, head_dim)
-    attn_weights = (q @ kk.transpose(-2, -1)) * (head_dim ** -0.5)
-    attn_weights = attn_weights.softmax(dim=-1)  # (B, H, N+1, N+1)
 
-    attn_cls = attn_weights[:, :, 0, 1:]  # CLS → patch: (B, H, N)
-    attn_avg = attn_cls.mean(dim=1)        # (B, N)
-    indices  = attn_avg.topk(k, dim=-1).indices  # (B, k)
+    qkv = qkv_out.reshape(B, N_plus1, 3, H, head_dim)
+    q   = qkv[:, :, 0].transpose(1, 2)
+    kk  = qkv[:, :, 1].transpose(1, 2)
+
+    attn_weights = (q @ kk.transpose(-2, -1)) * (head_dim ** -0.5)
+    attn_weights = attn_weights.softmax(dim=-1)
+
+    attn_cls = attn_weights[:, :, 0, 1:]
+    attn_avg = attn_cls.mean(dim=1)                      # (B, N)
+
+    sorted_indices = attn_avg.argsort(dim=-1, descending=True)  # (B, 256)
+
+    if k == -1:
+        indices = sorted_indices                         # all 256 patches
+    else:
+        indices = sorted_indices[:, :k]                 # top-k only
+
     return indices, attn_avg
 
 class PurifiedClassifier(nn.Module):
@@ -69,15 +77,16 @@ class PurifiedClassifier(nn.Module):
         self.k = k
         self.neighborhood_radius = neighborhood_radius
 
-        if weight_scheme == 'increasing':
-            w = torch.arange(1, k+1, dtype=torch.float32)
-        elif weight_scheme == 'decreasing':
-            w = torch.arange(k, 0, -1, dtype=torch.float32)
+        if k != -1:
+            if weight_scheme == 'increasing':
+                w = torch.arange(1, k+1, dtype=torch.float32)
+            elif weight_scheme == 'decreasing':
+                w = torch.arange(k, 0, -1, dtype=torch.float32)
+            else:
+                w = torch.ones(k)
+            self.register_buffer('weights', w / w.sum())
         else:
-            w = torch.ones(k)
-
-        self.weights: torch.Tensor
-        self.register_buffer('weights', w / w.sum())
+            self.weights = None
 
     def forward(self, x):
         B      = x.shape[0]
@@ -86,6 +95,12 @@ class PurifiedClassifier(nn.Module):
         
         with torch.no_grad():
             indices, _ = topk_patches(x, self.classifier.dinov2, k=self.k)
+        n_steps = indices.shape[1]
+
+        if self.weights is None:
+            weights = torch.ones(n_steps, device=device) / n_steps
+        else:
+            weights = self.weights
 
         global_token = torch.zeros(B, 768, 16, 16, device=device)
 
@@ -114,7 +129,7 @@ class PurifiedClassifier(nn.Module):
                     z_t   = z_t - v * dt
 
                 z_clean = z_t  # full dense (B, 768, 16, 16)
-                global_token = global_token + self.weights[step] * z_clean
+                global_token = global_token + weights[step] * z_clean
                 local = z_clean
 
         x_rec  = self.rae.decode(global_token).clamp(0, 1)
