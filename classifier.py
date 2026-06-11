@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-    
+
 class DINO_classification(nn.Module):
     def __init__(self, dinov2, prototypes, normalize):
         super().__init__()
@@ -26,7 +26,7 @@ def get_neighborhood(row, col, grid_size=16, radius=1):
                 positions.append((r, c))
     return positions
 
-def topk_patches(x, dinov2, k):
+def topk_patches(x, dinov2, k, min_dist=0):
     B    = x.shape[0]
     mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1,3,1,1)
     std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1,3,1,1)
@@ -57,17 +57,42 @@ def topk_patches(x, dinov2, k):
     attn_cls = attn_weights[:, :, 0, 1:]
     attn_avg = attn_cls.mean(dim=1)                      # (B, N)
 
-    sorted_indices = attn_avg.argsort(dim=-1, descending=True)  # (B, 256)
+    if min_dist == 0:
+        sorted_indices = attn_avg.argsort(dim=-1, descending=True)
+        if k == -1:
+            return sorted_indices, attn_avg
+        return sorted_indices[:, :k], attn_avg
 
-    if k == -1:
-        indices = sorted_indices                         # all 256 patches
-    else:
-        indices = sorted_indices[:, :k]                 # top-k only
+    n_select = attn_avg.shape[1] if k == -1 else k
+    indices_list = []
 
-    return indices, attn_avg
+    for b in range(B):
+        scores   = attn_avg[b].clone()    # (256,)
+        selected = []
+
+        for _ in range(n_select):
+            available = (scores >= 0).sum().item()
+
+            if available == 0:
+                # pad with last selected if ran out of positions
+                selected.append(selected[-1] if selected else 0)
+                continue
+
+            idx      = scores.argmax().item()
+            selected.append(idx)
+
+            # suppress all positions within Chebyshev distance min_dist
+            row, col = idx // 16, idx % 16
+            for r in range(max(0, row - min_dist), min(16, row + min_dist + 1)):
+                for c in range(max(0, col - min_dist), min(16, col + min_dist + 1)):
+                    scores[r * 16 + c] = -1.0
+
+        indices_list.append(torch.tensor(selected, dtype=torch.long))
+
+    return torch.stack(indices_list).to(x.device), attn_avg
 
 class PurifiedClassifier(nn.Module):
-    def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10, weight_scheme='equal', neighborhood_radius=3):
+    def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10, weight_scheme='equal', neighborhood_radius=3, min_patch_dist=0):
         super().__init__()
         self.rae = rae
         self.dit = dit
@@ -76,6 +101,7 @@ class PurifiedClassifier(nn.Module):
         self.n_steps = n_steps
         self.k = k
         self.neighborhood_radius = neighborhood_radius
+        self.min_dist = min_patch_dist
 
         if k != -1:
             if weight_scheme == 'increasing':
@@ -94,7 +120,7 @@ class PurifiedClassifier(nn.Module):
         y_null = torch.full((B,), self.dit.y_embedder.num_classes, dtype=torch.long, device=device)
         
         with torch.no_grad():
-            indices, _ = topk_patches(x, self.classifier.dinov2, k=self.k)
+            indices, _ = topk_patches(x, self.classifier.dinov2, k=self.k, min_dist=self.min_dist)
         n_steps = indices.shape[1]
 
         if self.weights is None:
@@ -107,7 +133,7 @@ class PurifiedClassifier(nn.Module):
         local = None
         with torch.no_grad():
             z_full = self.rae.encode(x)
-            for step in range(self.k):
+            for step in range(n_steps):
                 z_input = torch.randn_like(z_full) if local is None else local.clone()
 
                 # inject adversarial content at attended position + neighborhood
