@@ -92,7 +92,7 @@ def topk_patches(x, dinov2, k, min_dist=0):
     return torch.stack(indices_list).to(x.device), attn_avg
 
 class PurifiedClassifier(nn.Module):
-    def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10, weight_scheme='equal', neighborhood_radius=3, min_patch_dist=0):
+    def __init__(self, rae, dit, classifier, t_noise, n_steps, k=10, weight_scheme='equal', neighborhood_radius=3, min_patch_dist=0, random_order=False):
         super().__init__()
         self.rae = rae
         self.dit = dit
@@ -102,6 +102,7 @@ class PurifiedClassifier(nn.Module):
         self.k = k
         self.neighborhood_radius = neighborhood_radius
         self.min_dist = min_patch_dist
+        self.random_order = random_order
 
         if k != -1:
             if weight_scheme == 'increasing':
@@ -117,28 +118,27 @@ class PurifiedClassifier(nn.Module):
     def forward(self, x):
         B      = x.shape[0]
         device = x.device
-        y_null = torch.full((B,), self.dit.y_embedder.num_classes, dtype=torch.long, device=device)
-        
+        y_null = torch.full((B,), self.dit.y_embedder.num_classes,
+                            dtype=torch.long, device=device)
+
+        global_cls = torch.zeros(B, 768, device=device)
+        local      = None
+
         with torch.no_grad():
-            indices, _ = topk_patches(x, self.classifier.dinov2, k=self.k, min_dist=self.min_dist)
-        n_steps = indices.shape[1]
+            indices, _ = topk_patches(x, self.classifier.dinov2,
+                                    k=self.k, min_dist=self.min_dist)
+            n_steps = indices.shape[1]
 
-        if self.weights is None:
-            weights = torch.ones(n_steps, device=device) / n_steps
-        else:
-            weights = self.weights
+            weights = (torch.ones(n_steps, device=device) / n_steps
+                    if self.weights is None else self.weights)
 
-        global_token = torch.zeros(B, 768, 16, 16, device=device)
-
-        local = None
-        with torch.no_grad():
             z_full = self.rae.encode(x)
+
             for step in range(n_steps):
                 z_input = torch.randn_like(z_full) if local is None else local.clone()
 
-                # inject adversarial content at attended position + neighborhood
                 for b in range(B):
-                    idx = indices[b, step].item()
+                    idx      = indices[b, step].item()
                     row, col = idx // 16, idx % 16
                     for r, c in get_neighborhood(row, col, radius=self.neighborhood_radius):
                         z_input[b, :, r, c] = z_full[b, :, r, c]
@@ -146,21 +146,31 @@ class PurifiedClassifier(nn.Module):
                 noise = torch.randn_like(z_input)
                 z_t   = (1 - self.t_noise) * z_input + self.t_noise * noise
 
-                # reverse ODE
                 dt = self.t_noise / self.n_steps
                 for s in range(self.n_steps):
                     t_cur = self.t_noise - s * dt
-                    t_vec = torch.full((B,), t_cur, device=device,dtype=torch.float32)
+                    t_vec = torch.full((B,), t_cur, device=device, dtype=torch.float32)
                     v     = self.dit(z_t, t_vec, y_null)
                     z_t   = z_t - v * dt
 
-                z_clean = z_t  # full dense (B, 768, 16, 16)
-                global_token = global_token + weights[step] * z_clean
-                local = z_clean
+                z_clean = z_t
+                local   = z_clean
 
-        x_rec  = self.rae.decode(global_token).clamp(0, 1)
-        x_rec  = F.interpolate(x_rec, size=(224, 224), mode='bicubic', align_corners=False)
+                # each patch votes: decode → DINOv2 → CLS
+                x_step = self.rae.decode(z_clean).clamp(0, 1)
+                x_step = F.interpolate(x_step, (224, 224),mode='bicubic', align_corners=False)
+                cls_k  = self.classifier.dinov2(self.classifier.normalize(x_step))
+                cls_k  = F.normalize(cls_k, dim=-1)
+                global_cls = global_cls + weights[step] * cls_k
 
-        # BPDA: forward uses purified, backward is straight-through
-        x_bpda = x + (x_rec - x).detach()
-        return self.classifier(x_bpda)
+        # consensus logits from accumulated CLS votes
+        purified_logits = global_cls @ self.classifier.prototypes.T * 100
+
+        # BPDA: use last z_clean as purified image for gradient
+        # forward = purified_logits, backward = gradient at purified x_rec
+        x_rec      = self.rae.decode(local).clamp(0, 1)
+        x_rec      = F.interpolate(x_rec, (224, 224),
+                                mode='bicubic', align_corners=False)
+        x_bpda     = x + (x_rec - x).detach()
+        bpda_logits = self.classifier(x_bpda)
+        return bpda_logits + (purified_logits - bpda_logits).detach()

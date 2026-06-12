@@ -32,6 +32,7 @@ p.add_argument('--start-idx', type=int, default=0,    help='Start sample index')
 p.add_argument('--end-idx',   type=int, default=None, help='End sample index (exclusive)')
 p.add_argument('--neighborhood-radius', type=int, default=3, help='Radius of neighborhood around attended position (1=3x3, 2=5x5)')
 p.add_argument('--min-patch-dist', type=int, default=0, help='Minimum Chebyshev distance between selected patches. 0=standard top-k, set to neighborhood_radius to guarantee no overlap')
+p.add_argument('--random-order', action='store_true', help='Shuffle patch indices randomly instead of attention ordering')
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -75,7 +76,8 @@ if __name__ == "__main__":
         rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk,
         weight_scheme=args.weight_scheme,
         neighborhood_radius=args.neighborhood_radius,
-        min_patch_dist=args.min_patch_dist
+        min_patch_dist=args.min_patch_dist,
+        random_order=args.random_order
     ).to(device).eval()
 
     n_eval = args.n_samples or 512
@@ -115,7 +117,7 @@ if __name__ == "__main__":
             f'_r{args.neighborhood_radius}_md{args.min_patch_dist}'
             f'_iter{adversary.apgd.n_iter}_eot{adversary.apgd.eot_iter}'
             f'_noise{args.t_noise}')
-            
+
     os.makedirs(ckpt_dir, exist_ok=True)
 
     chunk_size = args.batch_size
