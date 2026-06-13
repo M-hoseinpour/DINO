@@ -35,7 +35,7 @@ def imagenet_val_loader(val_path, batch_size=16):
         transforms.ToTensor(),
     ])
     dataset = datasets.ImageFolder(val_path, transform=transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
 def imagenet_train_loader(train_path, batch_size=64):
     transform = transforms.Compose([
