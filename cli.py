@@ -10,7 +10,7 @@ from tqdm import tqdm
 from autoattack import AutoAttack
 from classifier import DINO_classification, PurifiedClassifier
 from consts import DECODER_PATH, DIT_PATH, STATS_PATH
-from data import cifar10_loader
+from data import cifar10_loader, imagenet_loader, imagenet_train_loader, imagenet_val_loader
 from utils import ensure_weights, extract_crops, load_prototypes, normalize, seed_eveything
 
 sys.path.insert(0, str(Path(__file__).parent / 'RAE' / 'src'))
@@ -21,9 +21,9 @@ p = argparse.ArgumentParser()
 p.add_argument('--decoder-path', default=DECODER_PATH)
 p.add_argument('--stats-path',   default=STATS_PATH)
 p.add_argument('--dit-path',     default=DIT_PATH)
-p.add_argument('--t-noise',      type=float, default=0.95)
-p.add_argument('--n-steps',      type=int,   default=3)
-p.add_argument('--eps',          type=float, default=8/255)
+p.add_argument('--t-noise',      type=float, default=0.9)
+p.add_argument('--n-steps',      type=int,   default=5)
+p.add_argument('--eps',          type=float, default=None)
 p.add_argument('--batch-size',   type=int,   default=16)
 p.add_argument('--n-samples',    type=int,   default=None)
 p.add_argument('--topk',    type=int,   default=5)
@@ -33,6 +33,11 @@ p.add_argument('--end-idx',   type=int, default=None, help='End sample index (ex
 p.add_argument('--neighborhood-radius', type=int, default=3, help='Radius of neighborhood around attended position (1=3x3, 2=5x5)')
 p.add_argument('--min-patch-dist', type=int, default=0, help='Minimum Chebyshev distance between selected patches. 0=standard top-k, set to neighborhood_radius to guarantee no overlap')
 p.add_argument('--random-order', action='store_true', help='Shuffle patch indices randomly instead of attention ordering')
+p.add_argument('--dataset',          type=str, default='cifar10', choices=['cifar10', 'imagenet'])
+p.add_argument('--imagenet-train',   type=str, default=None, help='Path to ImageNet train directory')
+p.add_argument('--imagenet-val',     type=str, default=None, help='Path to ImageNet val directory')
+p.add_argument('--prototypes-path',  type=str, default=None, help='Path to cache/load prototypes (.pt file)')
+p.add_argument('--crop-size', type=int, default=112, help='Pixel size of crop extracted at each attended patch (default 112 = 8x8 patches)')
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -41,12 +46,35 @@ if __name__ == "__main__":
     device  = torch.device('cuda' if is_cuda else 'cpu')
     seed_eveything(is_cuda)
 
-    train_loader, test_loader = cifar10_loader(test_batch_size=args.batch_size)
+    if args.dataset == 'imagenet':
+        assert args.imagenet_val, 'provide --imagenet-val path'
+
+        test_loader = imagenet_val_loader(args.imagenet_val, args.batch_size)
+
+        if args.prototypes_path and os.path.exists(args.prototypes_path):
+            train_loader = None   # skip — will load from cache
+        else:
+            assert args.imagenet_train, 'provide --imagenet-train or a cached --prototypes-path'
+            train_loader = imagenet_train_loader(args.imagenet_train)
+
+        n_classes  = 1000
+        default_ep = 4/255
+    else:
+        train_loader, test_loader = cifar10_loader(test_batch_size=args.batch_size)
+        n_classes  = 10
+        default_ep = 8/255
+
+    eps = args.eps if args.eps is not None else default_ep
+    print(f'[attack] eps = {eps:.4f} ({eps*255:.1f}/255)')
 
     dinov2 = cast(nn.Module, torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14'))
     dinov2 = dinov2.to(device).eval()
 
-    prototypes = load_prototypes(device, train_loader, normalize, dinov2)
+    prototypes = load_prototypes(
+        device, train_loader, normalize, dinov2,
+        n_classes=n_classes,
+        cache_path=args.prototypes_path
+    )
     classifier = DINO_classification(dinov2, prototypes, normalize).to(device).eval()
     ensure_weights(args.decoder_path, args.stats_path, args.dit_path)
 
@@ -73,10 +101,11 @@ if __name__ == "__main__":
     dit = dit.to(device).eval()
 
     purified_model = PurifiedClassifier(
-        rae, dit, classifier, t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk,
+        rae, dit, classifier,
+        t_noise=args.t_noise, n_steps=args.n_steps, k=args.topk,
         weight_scheme=args.weight_scheme,
-        neighborhood_radius=args.neighborhood_radius,
         min_patch_dist=args.min_patch_dist,
+        crop_size=args.crop_size,
         random_order=args.random_order
     ).to(device).eval()
 
@@ -85,7 +114,7 @@ if __name__ == "__main__":
     end_idx   = args.end_idx if args.end_idx is not None else n_eval
 
     adversary = AutoAttack(
-        purified_model, norm='Linf', eps=args.eps,
+        purified_model, norm='Linf', eps=eps,
         version='rand', device=str(device), verbose=True,
         log_path=f'attack_log_{start_idx}_{end_idx}.txt'
     )
@@ -111,7 +140,7 @@ if __name__ == "__main__":
 
     print(f'Processing samples {start_idx} to {end_idx}')
 
-    ckpt_dir = (f'ckpt_eps{int(args.eps*255)}_n{n_eval}'
+    ckpt_dir = (f'ckpt_eps{int(eps*255)}_n{n_eval}'
             f'_top{args.topk}k_{args.n_steps}steps'
             f'_{args.weight_scheme}'
             f'_r{args.neighborhood_radius}_md{args.min_patch_dist}'

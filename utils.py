@@ -37,45 +37,36 @@ def clean_accuracy(test_loader, model, device):
 
     print(f'Clean accuracy (DINOv2-B): {correct/total*100:.2f}%')
 
-def load_prototypes(device, train_loader, normalize, dinov2):
-    PROTOTYPE_PATH = './dinov2_b_prototypes.pt'
+def load_prototypes(device, train_loader, normalize, dinov2, n_classes=10, cache_path=None):
+    # load from cache if available
+    if cache_path and os.path.exists(cache_path):
+        print(f'[prototypes] loaded from {cache_path}')
+        return torch.load(cache_path, map_location=device)
 
-    if os.path.exists(PROTOTYPE_PATH):
-        prototypes = torch.load(PROTOTYPE_PATH, map_location=device)
-        if torch.isnan(prototypes).any():
-            os.remove(PROTOTYPE_PATH)
-            print('Corrupted — recomputing')
-        else:
-            print(f'Loaded prototypes: {prototypes.shape}')
-    else:
-        prototype_sums   = torch.zeros(10, 768, device=device)
-        prototype_counts = torch.zeros(10, device=device)
+    print(f'[prototypes] computing for {n_classes} classes...')
+    dinov2.eval()
+    sums   = torch.zeros(n_classes, 768, device=device)
+    counts = torch.zeros(n_classes,      device=device)
 
-        with torch.no_grad():
-            for images, labels in tqdm(train_loader):
-                images = images.to(device)
-                labels = labels.to(device)
+    with torch.no_grad():
+        for images, labels in tqdm(train_loader, desc='prototypes'):
+            images = images.to(device)
+            labels = labels.to(device)
+            feats  = dinov2(normalize(images))          # (B, 768)
+            feats  = F.normalize(feats, dim=-1)
+            for c in range(n_classes):
+                mask = (labels == c)
+                if mask.any():
+                    sums[c]   += feats[mask].sum(0)
+                    counts[c] += mask.sum()
 
-                embeddings = dinov2(normalize(images))
-                embeddings = F.normalize(embeddings, dim=-1)
+    prototypes = F.normalize(sums / counts.unsqueeze(1), dim=-1)
 
-                nan_mask = torch.isnan(embeddings).any(dim=1)
-                if nan_mask.any():
-                    embeddings = embeddings[~nan_mask]
-                    labels     = labels[~nan_mask]
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save(prototypes, cache_path)
+        print(f'[prototypes] saved to {cache_path}')
 
-                for c in range(10):
-                    mask = (labels == c)
-                    if mask.any():
-                        prototype_sums[c]   += embeddings[mask].sum(dim=0)
-                        prototype_counts[c] += mask.sum()
-
-        prototypes = prototype_sums / prototype_counts.unsqueeze(1)
-        prototypes = F.normalize(prototypes, dim=-1)
-
-        print(f'NaN: {torch.isnan(prototypes).any()}')
-        print(f'Shape: {prototypes.shape}')
-        torch.save(prototypes, PROTOTYPE_PATH)
     return prototypes
 
 def extract_crops(x, topk_indices, crop_size=84, target_size=224):
